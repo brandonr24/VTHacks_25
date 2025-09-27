@@ -157,20 +157,20 @@ export default function ASLVoiceClient() {
     setOutputs(outs);
     const preferred = outs.find((d) => /cable|blackhole|loopback|virtual/i.test(d.label));
     if (preferred) setChosenOutputId(preferred.deviceId);
-    log("Pick your virtual output and click Use This Output.");
+    log("Pick your virtual output and click \"Use This Output\".");
   }
 
   async function applyOutput() {
     const el = audioRef.current;
     if (!el) return;
     if (!("setSinkId" in el)) {
-      log("setSinkId not supported – use OS-level routing (VB-CABLE/BlackHole).");
+      log("setSinkId not supported, use VBCable.");
       return;
     }
     try {
       await el.setSinkId(chosenOutputId || "default");
       const match = outputs.find((o) => o.deviceId === chosenOutputId);
-      log(`Audio routed to: ${match?.label || "default"}. Select this as the Microphone in Zoom/Meet.`);
+      log(`Audio routed to: ${match?.label || "default"}.`);
     } catch (e) {
       console.error(e);
       log("Failed to set output. You can still route at OS level.");
@@ -180,35 +180,40 @@ export default function ASLVoiceClient() {
   return (
     <div className="flex-col">
       {/* Left: Local preview & transport controls */}
-      <div className="rounded-2xl border border-neutral-200 bg-white p-4 shadow-sm mb-8">
+      <div className="rounded-2xl border-[1px] border-zinc-800 bg-[#141414cc] p-6 w-full shadow-sm mb-6 text-black">
         <div className="relative">
           <video
             ref={videoRef}
             autoPlay
             playsInline
             muted
-            className="h-auto w-full rounded-xl bg-black object-cover"
+            className="h-[500px] w-full rounded-xl bg-black object-cover"
             style={{ transform: flipV ? "scaleX(-1)" : "none" }} // flip preview only
           />
 
         </div>
-
-        <div className="mt-4 flex items-center gap-3">
-          <button
-            onClick={start}
-            className="rounded-xl bg-neutral-900 px-4 py-2 text-white hover:bg-neutral-800 disabled:opacity-50"
-            disabled={connected}
-          >
-            Start Streaming
-          </button>
-          <button
-            onClick={stop}
-            className="rounded-xl border border-neutral-300 px-4 py-2 hover:bg-neutral-50"
-          >
-            Stop
-          </button>
+        <div className="flex-between w-full mt-4">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={start}
+              className="rounded-xl border-[2px] border-black bg-white py-2 px-5 text-black transition-all hover:bg-black hover:text-white text-center text-sm font-inter flex items-center justify-center"
+              disabled={connected}
+            >
+              Start Streaming
+            </button>
+            <button
+              onClick={stop}
+              className="rounded-xl border-[2px] border-black bg-white py-2 px-5 text-black transition-all hover:bg-black hover:text-white text-center text-sm font-inter flex items-center justify-center"
+            >
+              Stop
+            </button>
+          </div>
+          <div className="">
+            <p className="text-right text-sm text-white">{status}</p>
+          </div>
+          
         </div>
-        <p className="mt-2 text-sm text-neutral-600">{status}</p>
+        
       </div>
 
       {/* Right: Output routing to virtual mic */}
@@ -248,11 +253,6 @@ export default function ASLVoiceClient() {
 
         {/* Hidden remote audio element that plays backend TTS */}
         <audio ref={audioRef} autoPlay className="hidden" />
-
-        <ul className="mt-4 list-disc pl-6 text-sm text-neutral-600">
-          <li>Requires Chromium over HTTPS for <code>setSinkId</code>. If unsupported, route at OS level.</li>
-          <li>Pro tip: run this app in Chrome and your meeting in Firefox to keep audio routes separate.</li>
-        </ul>
       </div>
     </div>
   );
