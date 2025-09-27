@@ -1,14 +1,29 @@
 from openai import OpenAI
-
+"""
 def main():
     # Get ChatGPT API Key
     try:
-        client = OpenAI()
+        client = OpenAI(api_key="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")
         while (True):
             input_message = input("Enter your input words in brackets: ")
             if input_message == "stop" or input_message == "STOP":
                 break
             callLLM(client, input_message)
+
+    except Exception as e:
+        # Handle the case where the API key is not found or other initial errors
+        print(f"Error initializing OpenAI client: {e}")
+        # You might need to set the API key explicitly if not using environment variables:
+        # client = OpenAI(api_key="YOUR_SECRET_API_KEY") # NOT RECOMMENDED FOR PRODUCTION
+"""
+def useClient(input_message):
+    try:
+        client = OpenAI(api_key="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")
+        # while (True):
+            # input_message = input("Enter your input words in brackets: ")
+            # if input_message == "stop" or input_message == "STOP":
+            #     break
+        callLLM(client, input_message)
 
     except Exception as e:
         # Handle the case where the API key is not found or other initial errors
@@ -46,7 +61,7 @@ def callLLM(client, input_text):
         # garbage case
         {"role": "user", "content": "[Ephemeral, Zephyr, Quasar, Labyrinth, Serendipity, Mellifluous, Zenith, Solitude, Capricious, "
         + "Luminescent, Equinox, Susurrus, Ponder, Voracious, Glimmer, Tundra, Helix, Obfuscate, Pristine, Wander]"}, 
-        {"role": "assistant", "content": "[]"}
+        {"role": "assistant", "content": "[]"},
     ]
 
     try:
@@ -66,6 +81,7 @@ def callLLM(client, input_text):
     
     except Exception as e:
         print(f"An error occurred during the API call: {e}")
-
+"""
 if __name__ == "__main__":
     main()
+"""
