@@ -4,16 +4,13 @@
 camera_app.py - Simple webcam "camera app" using OpenCV.
 
 Controls:
-  SPACE  : take a photo (saved into photos/)
-  r      : start/stop video recording (saved into videos/)
-  c      : switch to next camera index
-  f      : toggle fullscreen
   ESC    : quit
 """
 
 import cv2
 
 def main():
+
     # Open default camera (index 0)
     cap = cv2.VideoCapture(0)
 
