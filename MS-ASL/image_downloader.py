@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 extract_file = "extracted_images"
-data_file = "./MSASL_train.json"
+data_file = "MSASL_train.json"
 fps_for_all = 1
 
 def load_json(path: str | Path) -> Any:
@@ -70,7 +70,7 @@ def download_with_ytdlp(url: str, output_dir: Path) -> Path:
         raise RuntimeError(f"[yt-dlp] Error downloading video: {e}")
 
 # ---- Frame extraction ----
-def extract_frames(video_path: Path, output_dir: Path, fps: float, image_file_name: str, size=(640, 640)):
+def extract_frames(video_path: Path, output_dir: Path, fps: float, image_file_name: str, start_frame: float, end_frame:float, size=(640, 640)):
     """
     Extract frames at a true N frames-per-second rate (fps>0).
     """
@@ -109,7 +109,8 @@ def extract_frames(video_path: Path, output_dir: Path, fps: float, image_file_na
         if frame_idx % stride == 0:
             interp = cv2.INTER_AREA if frame.shape[0] >= size[1] or frame.shape[1] >= size[0] else cv2.INTER_LINEAR
             resized = cv2.resize(frame, size, interpolation=interp)
-            cv2.imwrite(str(output_dir / f"frame_{frame_idx:06d}.jpg"), resized)
+            if frame_idx >= start_frame and frame_idx <= end_frame:
+                cv2.imwrite(str(output_dir / f"frame_{frame_idx:06d}.jpg"), resized)
             saved += 1
 
         frame_idx += 1
@@ -149,7 +150,7 @@ def main():
 
             if not skip:
                 try:
-                    extract_frames(video_path, frames_dir, fps=fps_for_all, image_file_name=imageData['clean_text'])
+                    extract_frames(video_path, frames_dir, fps=fps_for_all, image_file_name=imageData['clean_text'], start_frame=imageData['start_time'], end_frame=imageData['end_time'])
                 except Exception as e:
                     print(e)
 
