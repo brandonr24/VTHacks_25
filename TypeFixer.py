@@ -64,7 +64,7 @@ def ai_concise(text: str, level: str = "standard") -> str:
     """
     from openai import OpenAI  # pip install openai>=1.0
 
-    client = OpenAI(api_key="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")
+    client = OpenAI(api_key="")
 
     styles = {
         "light": "Only fix casing, spacing, and add the fewest necessary words to make one grammatical sentence.",
