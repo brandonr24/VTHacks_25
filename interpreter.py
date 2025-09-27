@@ -27,7 +27,9 @@ def callLLM(client, input_text):
         + "based on how many continuous duplicates is fed. For example the list: "
         + "[the, the, the, the, one, the, the, quick, quick, quick, quack, quick, quick] " 
         + "would have the output: [the, quick]. It is likely that the actual input will "
-        + "contain far more duplicates and more false words."},
+        + "contain far more duplicates and more false words. If there is a relatively long string of non-continuous words, "
+        + "it is likely that the neural network is outputting garbage because nothing is being signed. Thus, "
+        + "ignore these cases."},
         #Example Input
         {"role": "user", "content": "[hi, hi, hi, hi, hi, hi, hi, bye, bye, hi, hi, hi, hi, no, hi, hi, hi, bye, hi, "
          + "hi, yes, no, no, hi, hi, my, my, my, my, my, my, my, my, your, my, my, my, eye, my, my, name, name, name, "
@@ -40,7 +42,11 @@ def callLLM(client, input_text):
         #Example Response to input
         {"role": "assistant", "content": "[those]"},
         {"role": "user", "content": "[the, the, the]"}, # smaller scale examples so the model knows to go off of relative scale
-        {"role": "assistant", "content": "[the]"}
+        {"role": "assistant", "content": "[the]"},
+        # garbage case
+        {"role": "user", "content": "[Ephemeral, Zephyr, Quasar, Labyrinth, Serendipity, Mellifluous, Zenith, Solitude, Capricious, "
+        + "Luminescent, Equinox, Susurrus, Ponder, Voracious, Glimmer, Tundra, Helix, Obfuscate, Pristine, Wander]"}, 
+        {"role": "assistant", "content": "[]"}
     ]
 
     try:
