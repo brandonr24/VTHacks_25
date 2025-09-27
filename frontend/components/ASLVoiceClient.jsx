@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import Combobox from "./ComboBox";
 
 const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || "";
 const OFFER_URL = `${BACKEND}/webrtc/offer`;
@@ -224,28 +225,25 @@ export default function ASLVoiceClient() {
           <em> microphone</em> in Zoom/Meet.
         </p>
 
-        <div className="mt-4 flex flex-wrap items-center gap-3">
+        <div className="mt-4 flex-between">
+        <div className="flex flex-wrap items-center gap-3">
           <button
             onClick={listOutputs}
-            className="rounded-xl border border-neutral-300 px-4 py-2 hover:bg-neutral-50"
+            className="rounded-xl border border-neutral-300 px-4 py-2 hover:bg-neutral-50 text-sm"
           >
             List Devices
           </button>
-          <select
+          <Combobox
+            items={[{ value: "", label: "(choose an output)" }, ...outputs.map((d) => ({ value: d.deviceId, label: d.label || d.deviceId }))]}
             value={chosenOutputId}
-            onChange={(e) => setChosenOutputId(e.target.value)}
-            className="min-w-[260px] rounded-xl border border-neutral-300 bg-white px-3 py-2"
-          >
-            <option value="">(choose an output)</option>
-            {outputs.map((d) => (
-              <option key={d.deviceId} value={d.deviceId}>
-                {d.label || d.deviceId}
-              </option>
-            ))}
-          </select>
-          <button
+            onChange={(v) => setChosenOutputId(v)}
+            placeholder="(choose an output)"
+            searchablePlaceholder="Search outputs..."
+          />
+        </div>
+            <button
             onClick={applyOutput}
-            className="rounded-xl bg-neutral-900 px-4 py-2 text-white hover:bg-neutral-800"
+            className="rounded-xl bg-neutral-900 px-4 py-2 text-white hover:bg-neutral-800 text-sm"
           >
             Use This Output
           </button>
