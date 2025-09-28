@@ -106,8 +106,6 @@ def cleanUp():
 
 def predict(frame):
     global results 
-
-    p_time_start = time.time()
     # print("Called!")
     result = client.run_workflow(
         workspace_name="hackvt25",
