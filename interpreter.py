@@ -2,7 +2,7 @@ from openai import OpenAI
 
 def useClient(input_message):
     try:
-        client = OpenAI()
+        client = OpenAI(api_key="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")
         # while (True):
             # input_message = input("Enter your input words in brackets: ")
             # if input_message == "stop" or input_message == "STOP":
@@ -26,9 +26,7 @@ def callLLM(client, input_text):
         + "based on how many continuous duplicates is fed. For example the list: "
         + "[the, the, the, the, one, the, the, quick, quick, quick, quack, quick, quick] " 
         + "would have the output: [the, quick]. It is likely that the actual input will "
-        + "contain far more duplicates and more false words. If there is a relatively long string of non-continuous words, "
-        + "it is likely that the neural network is outputting garbage because nothing is being signed. Thus, "
-        + "ignore these cases."},
+        + "contain far more duplicates and more false words."},
         #Example Input
         {"role": "user", "content": "[hi, hi, hi, hi, hi, hi, hi, bye, bye, hi, hi, hi, hi, no, hi, hi, hi, bye, hi, "
          + "hi, yes, no, no, hi, hi, my, my, my, my, my, my, my, my, your, my, my, my, eye, my, my, name, name, name, "
@@ -42,14 +40,12 @@ def callLLM(client, input_text):
         {"role": "assistant", "content": "[those]"},
         {"role": "user", "content": "[the, the, the]"}, # smaller scale examples so the model knows to go off of relative scale
         {"role": "assistant", "content": "[the]"},
-        # garbage case
-        {"role": "user", "content": "[Ephemeral, Zephyr, Quasar, Labyrinth, Serendipity, Mellifluous, Zenith, Solitude, Capricious, "
-        + "Luminescent, Equinox, Susurrus, Ponder, Voracious, Glimmer, Tundra, Helix, Obfuscate, Pristine, Wander]"}, 
-        {"role": "assistant", "content": "[]"},
         {"role": "user", "content": "[O, O, O, O, O, O, K, O, O, O, O, O, O, O, K, O, O, O]"}, 
         {"role": "assistant", "content": "[O]"},
         {"role": "user", "content": "[Name, Name, Name, Name, Name, Name, F, F, F, F, F, F, O, O, F, F, O, F]"}, 
         {"role": "assistant", "content": "[Name, F]"},
+        {"role": "user", "content": "['my', 'my', 'my', 'Name', 'Name', 'Name', 'Name', 'Name', 'Name', 'F', 'O', 'O', 'B', 'B', 'F']"}, 
+        {"role": "assistant", "content": "[my, Name, O, B]"},
     ]
 
     try:

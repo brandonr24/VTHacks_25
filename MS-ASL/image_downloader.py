@@ -70,7 +70,7 @@ def download_with_ytdlp(url: str, output_dir: Path) -> Path:
         raise RuntimeError(f"[yt-dlp] Error downloading video: {e}")
 
 # ---- Frame extraction ----
-def extract_frames(video_path: Path, output_dir: Path, fps: float, image_file_name: str, start_frame: float, end_frame:float, size=(640, 640)):
+def extract_frames(video_path: Path, output_dir: Path, fps: float, image_file_name: str, start_frame: float, end_frame:float, frame_rates: int, size=(640, 640)):
     """
     Extract frames at a true N frames-per-second rate (fps>0).
     """
@@ -109,9 +109,9 @@ def extract_frames(video_path: Path, output_dir: Path, fps: float, image_file_na
         if frame_idx % stride == 0:
             interp = cv2.INTER_AREA if frame.shape[0] >= size[1] or frame.shape[1] >= size[0] else cv2.INTER_LINEAR
             resized = cv2.resize(frame, size, interpolation=interp)
-            if frame_idx >= start_frame and frame_idx <= end_frame:
+            if frame_idx >= start_frame*frame_rates and frame_idx <= end_frame*frame_rates:
                 cv2.imwrite(str(output_dir / f"frame_{frame_idx:06d}.jpg"), resized)
-            saved += 1
+                saved += 1
 
         frame_idx += 1
 
@@ -129,7 +129,7 @@ def safe_download(url: str, out_dir: Path) -> Path:
 
 def main():
     config = load_json(data_file)
-    for imageData in config:
+    for index, imageData in enumerate(config):
         skip = False
         url = (imageData['url'] or "").strip()
         if not (url.startswith("http://") or url.startswith("https://")):
@@ -150,9 +150,11 @@ def main():
 
             if not skip:
                 try:
-                    extract_frames(video_path, frames_dir, fps=fps_for_all, image_file_name=imageData['clean_text'], start_frame=imageData['start_time'], end_frame=imageData['end_time'])
+                    extract_frames(video_path, frames_dir, fps=fps_for_all, image_file_name=imageData['clean_text'], start_frame=imageData['start_time'], end_frame=imageData['end_time'], frame_rates=imageData['fps'])
                 except Exception as e:
                     print(e)
+                print("\nSuccessfully saved image", index)
+                print(imageData['start_time'], imageData['end_time'], "\n")
 
 if __name__ == "__main__":
     main()

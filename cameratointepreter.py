@@ -17,10 +17,10 @@ import threading
 import time
 
 # Replace with your model's project name and version number
-MODEL_ID = "custom-workflow-10"
+MODEL_ID = "custom-workflow-11"
 IMAGE_PATH = "./testImages/"
 FRAME_SKIP = 15 #After FRAME_SKIP amount of frames, use one frame to input into the CV model
-FRAME_SKIP_RATIO = 4 
+FRAME_SKIP_RATIO = 1 
 results = []
 
 from inference_sdk import InferenceHTTPClient
@@ -63,16 +63,6 @@ def main():
 
         # Show frame
         cv2.imshow(window_name, frame)
-
-        # # Pre process the frame using opencv's dnn preprocessing
-        # blob = cv2.dnn.blobFromImage(
-        # frame,
-        # 1/255.0,
-        # (416, 416), # Use your model's required size
-        # swapRB=True,
-        # crop=False
-        # )
-        # print(counter) 
 
         if (counter == 0):
             times_called = 0
@@ -117,6 +107,7 @@ def cleanUp():
 def predict(frame):
     global results 
 
+    p_time_start = time.time()
     # print("Called!")
     result = client.run_workflow(
         workspace_name="hackvt25",
@@ -124,53 +115,44 @@ def predict(frame):
         images={
             "image": frame
         },
-        use_cache=True # cache workflow definition for 15 minutes
+        use_cache=True 
     )
-    # print(result)
-    # print(f"For image path: {IMAGE_PATH + f}")
-    # print(result[0]['predictions']['predictions'])
+
+    result += client.run_workflow(
+        workspace_name="hackvt25",
+        workflow_id= MODEL_ID,
+        images={
+            "image": cv2.flip(frame, 1)
+        },
+        use_cache=True 
+    )
+
     try:
         # classID = result[0]['predictions']['predictions'][0]['class'] # grabs just the classification
         # confidence = result[0]['predictions']['predictions'][0]['confidence'] # grabs just the confidence
+        classID_max = -1
+        confidence_max = -1
         # Take the classification with the highest confidence
         for pred in result[0]:
-            # print(result[0][pred])
             try:
-                classID = result[0][pred]['predictions'][0]['class']
-                results.append(classID)
-                print(classID, result[0][pred]['predictions'][0]['confidence'], len(results)) 
-                # print(pred['predictions'][0]['class'])
-                # if confidence < pred['predictions'][0]['confidence']:
-                #     confidence = pred['predictions'][0]['confidence']
-                #     classID = pred['predictions'][0]['class']
+                if pred != 'output': #'output' gives a bunch of garbage
+                    confidence = result[0][pred][0]['predictions'][0]['confidence']
+                    if confidence > confidence_max: 
+                        classID = result[0][pred][0]['predictions'][0]['class']
+                        # print("1", classID, result[0][pred][0]['predictions'][0]['confidence'])#, len(results)) 
+                        # print(classID == 1, classID)
+                        if classID != "1" and classID != "1 0 0 1 0 1 1 0 1" and classID != "your" and confidence >= 0.4: 
+                            confidence_max = confidence
+                            classID_max = classID
+                            
+                            # print("1", classID, confidence, len(results)) 
+                if classID_max != -1:
+                    results.append(classID_max)
+                    print(results, confidence_max)
             except:
-                # print("Exception occured")
-                # print(pred)
                 pass
-                
-
-        # results.append(classID)
-
-        # try:
-        #     secondBestID = result[0]['predictions']['predictions'][1]['class'] # grabs just the classification
-        #     results.append(secondBestID)
-        # except:
-        #     pass
-
-        # print()
-        # print(results)
-        # itp.useClient(str(results))
     except:
         pass
-        # print("No prediction found")
-    
-    # print(results)
-
-    # if len(results) >= 5:
-    #     itp.useClient(str(results))
-        # results = results[2:]
-
-    # print()
 
 
 if __name__ == "__main__":
