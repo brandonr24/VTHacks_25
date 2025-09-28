@@ -1,24 +1,8 @@
 from openai import OpenAI
-"""
-def main():
-    # Get ChatGPT API Key
-    try:
-        client = OpenAI(api_key="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")
-        while (True):
-            input_message = input("Enter your input words in brackets: ")
-            if input_message == "stop" or input_message == "STOP":
-                break
-            callLLM(client, input_message)
 
-    except Exception as e:
-        # Handle the case where the API key is not found or other initial errors
-        print(f"Error initializing OpenAI client: {e}")
-        # You might need to set the API key explicitly if not using environment variables:
-        # client = OpenAI(api_key="YOUR_SECRET_API_KEY") # NOT RECOMMENDED FOR PRODUCTION
-"""
 def useClient(input_message):
     try:
-        client = OpenAI(api_key="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")
+        client = OpenAI(api_key="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")
         # while (True):
             # input_message = input("Enter your input words in brackets: ")
             # if input_message == "stop" or input_message == "STOP":
@@ -62,6 +46,10 @@ def callLLM(client, input_text):
         {"role": "user", "content": "[Ephemeral, Zephyr, Quasar, Labyrinth, Serendipity, Mellifluous, Zenith, Solitude, Capricious, "
         + "Luminescent, Equinox, Susurrus, Ponder, Voracious, Glimmer, Tundra, Helix, Obfuscate, Pristine, Wander]"}, 
         {"role": "assistant", "content": "[]"},
+        {"role": "user", "content": "[O, O, O, O, O, O, K, O, O, O, O, O, O, O, K, O, O, O]"}, 
+        {"role": "assistant", "content": "[O]"},
+        {"role": "user", "content": "[Name, Name, Name, Name, Name, Name, F, F, F, F, F, F, O, O, F, F, O, F]"}, 
+        {"role": "assistant", "content": "[Name, F]"},
     ]
 
     try:
