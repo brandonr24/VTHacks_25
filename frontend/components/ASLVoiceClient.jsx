@@ -5,12 +5,17 @@ import Combobox from "./ComboBox";
 
 const BACKEND = process.env.NEXT_PUBLIC_BACKEND_URL || "";
 const OFFER_URL = `${BACKEND}/webrtc/offer`;
+const TTS_URL = (txt) => `${BACKEND}/tts?text=${encodeURIComponent(txt)}`;
 
 export default function ASLVoiceClient() {
   const videoRef = useRef(null);
-  const audioRef = useRef(null);
+  const audioRef = useRef(null);           // sinks WebAudio destination stream
   const pcRef = useRef(null);
+  const dcRef = useRef(null);
   const localStreamRef = useRef(null);
+
+  const audioCtxRef = useRef(null);
+  const destNodeRef = useRef(null);
 
   const [connected, setConnected] = useState(false);
   const [status, setStatus] = useState("Idle");
@@ -23,6 +28,35 @@ export default function ASLVoiceClient() {
     console.log(s);
   }
 
+  // --- Set up WebAudio graph that we can route to a virtual output
+  async function setupAudioGraph() {
+    if (audioCtxRef.current) return;
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const dest = ac.createMediaStreamDestination();
+    audioCtxRef.current = ac;
+    destNodeRef.current = dest;
+
+    // an <audio> element that plays the WebAudio stream
+    const el = audioRef.current;
+    el.autoplay = true;
+    el.srcObject = dest.stream;
+
+    // user gesture already happened when Start button was clicked
+    try { await el.play(); } catch (_) {}
+  }
+
+  async function playBytesToVirtualMic(arrayBuffer) {
+    const ac = audioCtxRef.current;
+    const dest = destNodeRef.current;
+    if (!ac || !dest) return;
+
+    const buf = await ac.decodeAudioData(arrayBuffer.slice(0));
+    const src = ac.createBufferSource();
+    src.buffer = buf;
+    src.connect(dest);
+    src.start();
+  }
+
   // --- Media capture (video only)
   async function getCamera() {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -33,7 +67,7 @@ export default function ASLVoiceClient() {
     if (videoRef.current) videoRef.current.srcObject = stream;
   }
 
-  // --- Create peer connection, wire tracks/events
+  // --- Create peer connection, wire tracks/events, create DataChannel
   async function createPC() {
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
@@ -55,19 +89,26 @@ export default function ASLVoiceClient() {
     const vTracks = (localStreamRef.current?.getVideoTracks()) || [];
     vTracks.forEach((t) => pc.addTrack(t, localStreamRef.current));
 
-    // Downstream: expect an audio track from backend (live TTS)
-    pc.addEventListener("track", (ev) => {
-      if (ev.track.kind === "audio") {
-        const ms = new MediaStream([ev.track]);
-        if (audioRef.current) {
-          audioRef.current.srcObject = ms;
-          audioRef.current.play().catch(() => {}); // will work after Start click gesture
-        }
-        log("Receiving TTS audio from backend…");
+    // Data channel (frontend-initiated). Backend will attach to it and send text.
+    const dc = pc.createDataChannel("tts-text");
+    dc.onopen = () => log("DataChannel open (tts-text).");
+    dc.onclose = () => log("DataChannel closed.");
+    dc.onmessage = async (e) => {
+      const text = String(e.data || "").trim();
+      if (!text) return;
+      // fetch audio bytes from backend and play via WebAudio -> chosen output
+      try {
+        const res = await fetch(TTS_URL(text));
+        if (!res.ok) throw new Error(`TTS ${res.status}`);
+        const buf = await res.arrayBuffer();
+        await playBytesToVirtualMic(buf);
+      } catch (err) {
+        console.error("TTS fetch/play failed:", err);
       }
-    });
+    };
 
     pcRef.current = pc;
+    dcRef.current = dc;
   }
 
   // Wait for ICE gathering complete (helps when backend doesn't use trickle)
@@ -94,10 +135,10 @@ export default function ASLVoiceClient() {
     const pc = pcRef.current;
     if (!pc) throw new Error("PeerConnection not created.");
 
-    const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: false });
+    // We don't expect any remote audio track now (TTS is client-side).
+    const offer = await pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false });
     await pc.setLocalDescription(offer);
 
-    // Optional but safer for some backends:
     await waitForIceGatheringComplete(pc);
 
     const res = await fetch(OFFER_URL, {
@@ -109,12 +150,13 @@ export default function ASLVoiceClient() {
     const ans = await res.json();
     await pc.setRemoteDescription({ type: "answer", sdp: ans.sdp });
 
-    log("Connected – streaming video; playing live audio.");
+    log("Connected – streaming video; TTS will play locally via selected output.");
   }
 
   // --- Lifecycle controls
   async function start() {
     try {
+      await setupAudioGraph();
       await getCamera();
       await createPC();
       await negotiate();
@@ -131,6 +173,7 @@ export default function ASLVoiceClient() {
     } catch (e) {}
 
     pcRef.current = null;
+    dcRef.current = null;
 
     try {
       localStreamRef.current?.getTracks().forEach((t) => t.stop());
@@ -165,7 +208,7 @@ export default function ASLVoiceClient() {
     const el = audioRef.current;
     if (!el) return;
     if (!("setSinkId" in el)) {
-      log("setSinkId not supported, use VBCable.");
+      log("setSinkId not supported, route at OS level.");
       return;
     }
     try {
@@ -180,7 +223,7 @@ export default function ASLVoiceClient() {
 
   return (
     <div className="flex-col">
-      {/* Left: Local preview & transport controls */}
+      {/* Local preview & controls */}
       <div className="rounded-2xl border-[1px] border-zinc-800 bg-[#141414cc] p-6 w-full shadow-sm mb-6 text-black">
         <div className="relative">
           <video
@@ -189,10 +232,10 @@ export default function ASLVoiceClient() {
             playsInline
             muted
             className="h-[500px] w-full rounded-xl bg-black object-cover"
-            style={{ transform: flipV ? "scaleX(-1)" : "none" }} // flip preview only
+            style={{ transform: flipV ? "scaleX(-1)" : "none" }}
           />
-
         </div>
+
         <div className="flex-between w-full mt-4">
           <div className="flex items-center gap-3">
             <button
@@ -209,15 +252,13 @@ export default function ASLVoiceClient() {
               Stop
             </button>
           </div>
-          <div className="">
+          <div>
             <p className="text-right text-sm text-white">{status}</p>
           </div>
-          
         </div>
-        
       </div>
 
-      {/* Right: Output routing to virtual mic */}
+      {/* Output routing */}
       <div className="rounded-2xl border border-neutral-200 bg-white p-4 shadow-sm">
         <h2 className="text-lg font-medium">Route audio to virtual microphone</h2>
         <p className="mt-1 text-sm text-neutral-600">
@@ -226,22 +267,22 @@ export default function ASLVoiceClient() {
         </p>
 
         <div className="mt-4 flex-between">
-        <div className="flex flex-wrap items-center gap-3">
-          <button
-            onClick={listOutputs}
-            className="rounded-xl border border-neutral-300 px-4 py-2 hover:bg-neutral-50 text-sm"
-          >
-            List Devices
-          </button>
-          <Combobox
-            items={[{ value: "", label: "(choose an output)" }, ...outputs.map((d) => ({ value: d.deviceId, label: d.label || d.deviceId }))]}
-            value={chosenOutputId}
-            onChange={(v) => setChosenOutputId(v)}
-            placeholder="(choose an output)"
-            searchablePlaceholder="Search outputs..."
-          />
-        </div>
+          <div className="flex flex-wrap items-center gap-3">
             <button
+              onClick={listOutputs}
+              className="rounded-xl border border-neutral-300 px-4 py-2 hover:bg-neutral-50 text-sm"
+            >
+              List Devices
+            </button>
+            <Combobox
+              items={[{ value: "", label: "(choose an output)" }, ...outputs.map((d) => ({ value: d.deviceId, label: d.label || d.deviceId }))]}
+              value={chosenOutputId}
+              onChange={(v) => setChosenOutputId(v)}
+              placeholder="(choose an output)"
+              searchablePlaceholder="Search outputs..."
+            />
+          </div>
+          <button
             onClick={applyOutput}
             className="rounded-xl bg-neutral-900 px-4 py-2 text-white hover:bg-neutral-800 text-sm"
           >
@@ -249,8 +290,8 @@ export default function ASLVoiceClient() {
           </button>
         </div>
 
-        {/* Hidden remote audio element that plays backend TTS */}
-        <audio ref={audioRef} autoPlay className="hidden" />
+        {/* Hidden audio element that plays WebAudio destination (so we can setSinkId) */}
+        <audio ref={audioRef} className="hidden" />
       </div>
     </div>
   );

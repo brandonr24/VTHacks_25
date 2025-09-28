@@ -1,443 +1,404 @@
-from flask import Flask, request, jsonify, render_template_string
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
-import glob
-import time
+import io
+import asyncio
+import logging
+import threading
+import tempfile
+from fractions import Fraction
+from time import monotonic
+
+import numpy as np
+import av
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc.mediastreams import MediaStreamTrack
+
 from dotenv import load_dotenv
-from components.tts import TTSService
-from components.audio_player import get_audio_player
-
-# Load environment variables
-load_dotenv()
-
-app = Flask(__name__)
-
-# Initialize TTS service
+from gtts import gTTS
 try:
-    tts_service = TTSService()
-    print("TTS Service initialized successfully")
-except ValueError as e:
-    print(f"TTS Service initialization failed: {e}")
-    tts_service = None
+    import pyttsx3  # optional offline fallback
+except Exception:
+    pyttsx3 = None
 
-# Initialize audio player
-audio_player = get_audio_player()
+# --- Roboflow Inference SDK ---
+from inference_sdk import InferenceHTTPClient
 
-# Global queue for managing text input
-text_queue = []
+# ================== Config ==================
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": ["http://localhost:3000", "http://127.0.0.1:3000"]}})
+
+# --- Free TTS endpoint config (no token required) ---
+FREE_TTS_PROVIDER = os.getenv("FREE_TTS_PROVIDER", "gtts").lower()   # 'gtts' (online) or 'pyttsx3' (offline)
+FREE_TTS_LANG     = os.getenv("FREE_TTS_LANG", "en").strip()
+FREE_TTS_SLOW     = os.getenv("FREE_TTS_SLOW", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# --- Roboflow (required) ---
+ROBOFLOW_API_KEY    = os.getenv("ROBOFLOW_API_KEY", "").strip()
+ROBOFLOW_WORKSPACE  = os.getenv("ROBOFLOW_WORKSPACE", "hackvt25").strip()
+ROBOFLOW_WORKFLOWID = os.getenv("ROBOFLOW_WORKFLOW_ID", "custom-workflow-10").strip()
+
+# --- Realtime / pacing ---
+SAMPLE_RATE   = 48000        # Hz
+FRAME_MS      = 20           # ms per Opus frame
+FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000  # 960
+CHANNELS      = 1
+
+# --- Video sampling (infer every N frames) ---
+FRAME_SKIP_FRAMES = int(os.getenv("FRAME_SKIP_FRAMES", "0"))   # 0 = disabled; >0 = fixed skip
+FRAME_SKIP_RATIO  = int(os.getenv("FRAME_SKIP_RATIO", "4"))    # infer ~fps/4 if FRAME_SKIP_FRAMES=0
+CONFIDENCE_MIN    = float(os.getenv("CONFIDENCE_MIN", "0.50"))
+
+# --- Stabilization of recognized tokens ---
+STREAK_MIN       = int(os.getenv("STREAK_MIN", "3"))         # >= N repeats to accept a word
+WORD_COOLDOWN_S  = float(os.getenv("WORD_COOLDOWN_S", "1.2"))
+
+# --- Optional batching before sending to client TTS ---
+BATCH_TIMEOUT_S  = float(os.getenv("BATCH_TIMEOUT_S", "0.6"))
+
+# --- Exclude exact junk labels you observed locally ---
+EXCLUDE_EXACT = set(s.strip().lower() for s in os.getenv(
+    "EXCLUDE_EXACT", "1,1 0 0 1 0 1 1 0 1,your"
+).split(",") if s.strip())
+
+# Dedicated asyncio loop (Flask is sync)
+loop = asyncio.new_event_loop()
+threading.Thread(target=loop.run_forever, daemon=True).start()
+
+# Keep sessions
+SESSIONS = {}  # id(pc) -> {"pc": pc, "emitter": TextChannelEmitter, "video_task": task}
+
+
+# ================== TTS helpers for /tts endpoint ==================
+
+def _gtts_bytes(text: str) -> bytes:
+    buf = io.BytesIO()
+    gTTS(text=text, lang=FREE_TTS_LANG or "en", slow=FREE_TTS_SLOW).write_to_fp(buf)
+    return buf.getvalue()
+
+def _pyttsx3_bytes(text: str) -> bytes:
+    if pyttsx3 is None:
+        raise RuntimeError("pyttsx3 is not installed; set FREE_TTS_PROVIDER=gtts or install pyttsx3")
+    with tempfile.TemporaryDirectory() as td:
+        wav_path = os.path.join(td, "tts.wav")
+        engine = pyttsx3.init()
+        engine.save_to_file(text, wav_path)
+        engine.runAndWait()
+        with open(wav_path, "rb") as f:
+            return f.read()
+
+def _free_tts_bytes(text: str) -> bytes:
+    return _pyttsx3_bytes(text) if FREE_TTS_PROVIDER == "pyttsx3" else _gtts_bytes(text)
+
+
+# ================== Text emitter over DataChannel ==================
+
+class TextChannelEmitter:
+    """Batches tokens, then sends phrase strings over a DataChannel."""
+    def __init__(self):
+        self.channel = None
+        self._batch = []
+        self._last_token_time = 0.0
+
+    def attach(self, channel):
+        self.channel = channel
+
+    def _send_phrase(self, phrase: str):
+        ch = self.channel
+        if not ch:
+            return
+        # aiortc RTCDataChannel has .readyState
+        try:
+            if getattr(ch, "readyState", "open") == "open":
+                ch.send(phrase)
+        except Exception:
+            logging.exception("DataChannel send failed")
+
+    def add_token(self, token: str):
+        token = (token or "").strip()
+        if not token:
+            return
+        now = monotonic()
+        self._batch.append(token)
+        self._last_token_time = now
+
+        async def _await_idle_and_flush(last_time=now):
+            await asyncio.sleep(BATCH_TIMEOUT_S)
+            if self._last_token_time == last_time and self._batch:
+                phrase = " ".join(self._batch)
+                self._batch.clear()
+                self._send_phrase(phrase)
+
+        asyncio.ensure_future(_await_idle_and_flush())
+
+
+# ================== Sign Recognition from inbound video ==================
+
+class RoboflowSignRecognizer:
+    """
+    Runs a Roboflow workflow on sampled frames (raw + horizontally flipped).
+    Emits the highest-confidence label above CONFIDENCE_MIN.
+    Uses a 'streak' and cooldown to stabilize before sending.
+    """
+    def __init__(self):
+        if not ROBOFLOW_API_KEY:
+            raise RuntimeError("ROBOFLOW_API_KEY is not set")
+
+        self.client = InferenceHTTPClient(
+            api_url="https://serverless.roboflow.com",
+            api_key=ROBOFLOW_API_KEY,
+        )
+        self.workspace = ROBOFLOW_WORKSPACE
+        self.workflow_id = ROBOFLOW_WORKFLOWID
+
+        # Stabilizer state
+        self.curr_word = None
+        self.streak = 0
+        self.last_spoken = ""
+        self.cooldown_until = 0.0
+
+    def _iter_candidates(self, wf_result):
+        """Yield prediction dicts with 'class' and 'confidence' from a workflow result."""
+        try:
+            node_map = wf_result[0]
+        except Exception:
+            return
+        for node_key, node_val in node_map.items():
+            if node_key == "output":
+                continue
+            items = node_val if isinstance(node_val, list) else [node_val]
+            for item in items:
+                preds = item.get("predictions") or []
+                if isinstance(preds, list) and preds:
+                    yield preds[0]
+
+    def infer_image(self, bgr_image: np.ndarray):
+        """Run on original and flipped frames; return (best_class, best_conf) or (None, 0.0)."""
+        try:
+            res_a = self.client.run_workflow(
+                workspace_name=self.workspace,
+                workflow_id=self.workflow_id,
+                images={"image": bgr_image},
+                use_cache=True
+            )
+
+            bgr_flipped = bgr_image[:, ::-1, :]
+            res_b = self.client.run_workflow(
+                workspace_name=self.workspace,
+                workflow_id=self.workflow_id,
+                images={"image": bgr_flipped},
+                use_cache=True
+            )
+
+            best_cls, best_conf = None, 0.0
+
+            def consider(pred):
+                nonlocal best_cls, best_conf
+                cls = (pred.get("class") or "").strip()
+                if not cls or cls.lower() in EXCLUDE_EXACT:
+                    return
+                conf = float(pred.get("confidence") or 0.0)
+                if conf >= CONFIDENCE_MIN and conf > best_conf:
+                    best_cls, best_conf = cls, conf
+
+            for p in self._iter_candidates(res_a):
+                consider(p)
+            for p in self._iter_candidates(res_b):
+                consider(p)
+
+            if best_cls:
+                return best_cls, best_conf
+            return None, 0.0
+
+        except Exception as e:
+            logging.exception("Roboflow inference failed: %s", e)
+            return None, 0.0
+
+    def push_prediction(self, token: str, on_emit):
+        """Streak-based stabilizer."""
+        now = monotonic()
+        if token == self.curr_word:
+            self.streak += 1
+        else:
+            self.curr_word = token
+            self.streak = 1
+
+        if self.streak >= STREAK_MIN and token:
+            # cooldown on repeats
+            if token == self.last_spoken and now < self.cooldown_until:
+                return
+            self.last_spoken = token
+            self.cooldown_until = now + WORD_COOLDOWN_S
+            on_emit(token)
+
+
+async def consume_video_loop(track: MediaStreamTrack, emitter: TextChannelEmitter):
+    recognizer = RoboflowSignRecognizer()
+    frame_idx = 0
+    fps_guess = 24
+    frame_skip = FRAME_SKIP_FRAMES if FRAME_SKIP_FRAMES > 0 else max(1, fps_guess // FRAME_SKIP_RATIO)
+
+    logging.info("Video consumer started (frame_skip=%s)", frame_skip)
+
+    try:
+        while True:
+            vf = await track.recv()  # av.VideoFrame
+            frame_idx += 1
+
+            if frame_idx % frame_skip != 0:
+                continue
+
+            bgr = vf.to_ndarray(format="bgr24")
+
+            best_cls, best_conf = await loop.run_in_executor(None, recognizer.infer_image, bgr)
+            if best_cls:
+                def _emit(token):
+                    logging.info("Recognized (stabilized): %s (%.2f)", token, best_conf)
+                    emitter.add_token(token)
+                recognizer.push_prediction(best_cls, on_emit=_emit)
+
+    except asyncio.CancelledError:
+        logging.info("Video consumer cancelled")
+    except Exception as e:
+        logging.exception("Video consumer error: %s", e)
+    finally:
+        logging.info("Video consumer ended")
+
+
+# ================== WebRTC offer/answer ==================
+
+async def _wait_ice_complete(pc: RTCPeerConnection, timeout=2.0):
+    if pc.iceGatheringState == "complete":
+        return
+    done = asyncio.Event()
+
+    @pc.on("icegatheringstatechange")
+    def _():
+        if pc.iceGatheringState == "complete":
+            done.set()
+
+    try:
+        await asyncio.wait_for(done.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        pass
+
+
+async def handle_offer(offer_sdp: str, offer_type: str) -> str:
+    pc = RTCPeerConnection()
+    emitter = TextChannelEmitter()
+
+    @pc.on("iceconnectionstatechange")
+    def _():
+        logging.info("ICE state: %s", pc.iceConnectionState)
+
+    video_task_holder = {"task": None}
+
+    @pc.on("track")
+    def on_track(track):
+        logging.info("Inbound track: %s", track.kind)
+        if track.kind == "video":
+            task = asyncio.ensure_future(consume_video_loop(track, emitter))
+            video_task_holder["task"] = task
+
+        @track.on("ended")
+        async def _on_ended():
+            logging.info("Track %s ended", track.kind)
+            if video_task_holder["task"]:
+                video_task_holder["task"].cancel()
+
+    @pc.on("datachannel")
+    def on_datachannel(channel):
+        logging.info("DataChannel created: %s", channel.label)
+        if channel.label == "tts-text":
+            emitter.attach(channel)
+
+            @channel.on("open")
+            def _on_open():
+                try:
+                    channel.send("Connection established. Sign recognition is live.")
+                except Exception:
+                    pass
+
+            @channel.on("close")
+            def _on_close():
+                emitter.attach(None)
+
+    await pc.setRemoteDescription(RTCSessionDescription(sdp=offer_sdp, type=offer_type))
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+    await _wait_ice_complete(pc, timeout=2.0)
+
+    # Keep strong refs
+    SESSIONS[id(pc)] = {"pc": pc, "emitter": emitter, "video_task": video_task_holder["task"]}
+
+    logging.info("Answer created")
+    return pc.localDescription.sdp
+
+
+# ================== Routes ==================
 
 @app.route("/")
-def home():
-    """Simple HTML interface for testing TTS"""
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>TTS Queue Manager</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 40px; }
-            .container { max-width: 800px; margin: 0 auto; }
-            textarea { width: 100%; height: 100px; margin: 10px 0; }
-            button { padding: 10px 20px; margin: 5px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
-            button:hover { background: #0056b3; }
-            .status { margin: 20px 0; padding: 10px; background: #f8f9fa; border-radius: 4px; }
-            .queue-item { padding: 5px; margin: 2px 0; background: #e9ecef; border-radius: 3px; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Text-to-Speech Queue Manager</h1>
-            
-            <div class="status">
-                <h3>Status</h3>
-                <p id="status">TTS Service: <span id="tts-status">Loading...</span></p>
-                <p>Queue Length: <span id="queue-length">0</span></p>
-            </div>
-            
-            <h3>Add Text to Queue</h3>
-            <textarea id="textInput" placeholder="Enter text to convert to speech..."></textarea>
-            <br>
-            <button onclick="addToQueue()">Add to Queue</button>
-            <button onclick="addMultiple()">Add Multiple Sentences</button>
-            
-            <h3>Queue Management</h3>
-            <button onclick="playQueue()">Process Queue (Save Audio)</button>
-            <button onclick="clearQueue()">Clear Queue</button>
-            <button onclick="getStatus()">Refresh Status</button>
-            
-            <h3>Current Queue</h3>
-            <div id="queueDisplay"></div>
-            
-            <h3>Generated Audio Files</h3>
-            <button onclick="listAudioFiles()">Refresh Audio Files</button>
-            <button onclick="clearAudioFiles()">Clear Audio Files</button>
-            <div id="audioFilesDisplay"></div>
-            
-            <h3>Audio Playback</h3>
-            <button onclick="playAllAudio()" style="background: #28a745; color: white; padding: 12px 24px; font-size: 16px; border: none; border-radius: 6px; cursor: pointer; margin: 5px;">🎵 Play All Audio Files</button>
-            <button onclick="stopAudio()" style="background: #dc3545; color: white; padding: 12px 24px; font-size: 16px; border: none; border-radius: 6px; cursor: pointer; margin: 5px;">⏹️ Stop Playback</button>
-            <button onclick="getPlaybackStatus()" style="background: #17a2b8; color: white; padding: 12px 24px; font-size: 16px; border: none; border-radius: 6px; cursor: pointer; margin: 5px;">📊 Check Status</button>
-            <button onclick="generateAndPlay()" style="background: #6f42c1; color: white; padding: 12px 24px; font-size: 16px; border: none; border-radius: 6px; cursor: pointer; margin: 5px;">🎲 Generate & Play Random</button>
-            <div id="playbackStatus" style="margin-top: 15px; padding: 10px; background: #f8f9fa; border-radius: 4px; border-left: 4px solid #007bff;"></div>
-        </div>
-        
-        <script>
-            function addToQueue() {
-                const text = document.getElementById('textInput').value.trim();
-                if (!text) return;
-                
-                fetch('/api/add-text', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({text: text})
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        document.getElementById('textInput').value = '';
-                        getStatus();
-                    } else {
-                        alert('Error: ' + data.error);
-                    }
-                });
-            }
-            
-            function addMultiple() {
-                const text = document.getElementById('textInput').value.trim();
-                if (!text) return;
-                
-                const sentences = text.split('.').filter(s => s.trim());
-                sentences.forEach(sentence => {
-                    if (sentence.trim()) {
-                        fetch('/api/add-text', {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({text: sentence.trim() + '.'})
-                        });
-                    }
-                });
-                document.getElementById('textInput').value = '';
-                setTimeout(getStatus, 100);
-            }
-            
-            function playQueue() {
-                fetch('/api/play-queue', {method: 'POST'})
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        alert('Queue processing started - audio files will be saved');
-                        getStatus();
-                        // Refresh audio files after a short delay
-                        setTimeout(listAudioFiles, 2000);
-                    } else {
-                        alert('Error: ' + data.error);
-                    }
-                });
-            }
-            
-            function clearQueue() {
-                fetch('/api/clear-queue', {method: 'POST'})
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        getStatus();
-                    } else {
-                        alert('Error: ' + data.error);
-                    }
-                });
-            }
-            
-            function getStatus() {
-                fetch('/api/status')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('tts-status').textContent = data.tts_available ? 'Available' : 'Unavailable';
-                    document.getElementById('queue-length').textContent = data.queue_length;
-                    
-                    const queueDisplay = document.getElementById('queueDisplay');
-                    queueDisplay.innerHTML = '';
-                    data.queue.forEach((item, index) => {
-                        const div = document.createElement('div');
-                        div.className = 'queue-item';
-                        div.textContent = `${index + 1}. ${item}`;
-                        queueDisplay.appendChild(div);
-                    });
-                });
-            }
-            
-            function listAudioFiles() {
-                fetch('/api/audio-files')
-                .then(response => response.json())
-                .then(data => {
-                    const audioDisplay = document.getElementById('audioFilesDisplay');
-                    audioDisplay.innerHTML = '';
-                    
-                    if (data.files.length === 0) {
-                        audioDisplay.innerHTML = '<p>No audio files generated yet.</p>';
-                        return;
-                    }
-                    
-                    data.files.forEach((file, index) => {
-                        const div = document.createElement('div');
-                        div.className = 'queue-item';
-                        div.innerHTML = `
-                            <strong>${file.filename}</strong> (${file.size} bytes)
-                            <br><small>Generated: ${file.timestamp}</small>
-                            <br><small>📁 Saved in: audio_outputs/</small>
-                        `;
-                        audioDisplay.appendChild(div);
-                    });
-                });
-            }
-            
-            function clearAudioFiles() {
-                if (confirm('Are you sure you want to delete all audio files?')) {
-                    fetch('/api/clear-audio', {method: 'POST'})
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.success) {
-                            alert('Audio files cleared');
-                            listAudioFiles();
-                        } else {
-                            alert('Error: ' + data.error);
-                        }
-                    });
-                }
-            }
-            
-            function playAllAudio() {
-                fetch('/api/play-audio', {method: 'POST'})
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        alert('Audio playback started!');
-                        getPlaybackStatus();
-                    } else {
-                        alert('Error: ' + data.error);
-                    }
-                });
-            }
-            
-            function stopAudio() {
-                fetch('/api/stop-audio', {method: 'POST'})
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        alert('Audio playback stopped');
-                        getPlaybackStatus();
-                    } else {
-                        alert('Error: ' + data.error);
-                    }
-                });
-            }
-            
-            function getPlaybackStatus() {
-                fetch('/api/playback-status')
-                .then(response => response.json())
-                .then(data => {
-                    const statusDiv = document.getElementById('playbackStatus');
-                    statusDiv.innerHTML = `
-                        <p><strong>Status:</strong> ${data.is_playing ? 'Playing' : 'Stopped'}</p>
-                        <p><strong>Current File:</strong> ${data.current_file || 'None'}</p>
-                        <p><strong>Total Files:</strong> ${data.total_files}</p>
-                        <p><strong>Audio Available:</strong> ${data.audio_available ? 'Yes' : 'No'}</p>
-                    `;
-                });
-            }
-            
-            function generateAndPlay() {
-                // Generate 3 random sentences
-                const sentences = [
-                    "The beautiful mountain shines gracefully in the starlit sky.",
-                    "A mysterious forest drifts peacefully while touching the earth.",
-                    "The ancient temple blooms freely through the crystal cave."
-                ];
-                
-                let completed = 0;
-                const total = sentences.length;
-                
-                alert(`🎲 Generating ${total} random sentences and will play them automatically!`);
-                
-                // Add each sentence to the queue
-                sentences.forEach((sentence, index) => {
-                    fetch('/api/add-text', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({text: sentence})
-                    })
-                    .then(response => response.json())
-                    .then(data => {
-                        completed++;
-                        console.log(`Added sentence ${completed}/${total}: ${sentence}`);
-                        
-                        // When all sentences are added, wait a bit then start playback
-                        if (completed === total) {
-                            setTimeout(() => {
-                                alert('🎵 All sentences generated! Starting playback...');
-                                playAllAudio();
-                            }, 2000);
-                        }
-                    })
-                    .catch(error => {
-                        console.error('Error adding sentence:', error);
-                        completed++;
-                    });
-                });
-            }
-            
-            // Load status on page load
-            getStatus();
-            listAudioFiles();
-        </script>
-    </body>
-    </html>
-    """)
+def health():
+    return "OK", 200
 
-@app.route("/api/status")
-def get_status():
-    """Get current status of TTS service and queue"""
-    return jsonify({
-        "tts_available": tts_service is not None,
-        "queue_length": len(text_queue),
-        "queue": text_queue.copy()
-    })
 
-@app.route("/api/add-text", methods=["POST"])
-def add_text():
-    """Add text to the TTS queue"""
-    if not tts_service:
-        return jsonify({"success": False, "error": "TTS service not available"})
-    
-    data = request.get_json()
-    if not data or 'text' not in data:
-        return jsonify({"success": False, "error": "No text provided"})
-    
-    text = data['text'].strip()
+@app.route("/webrtc/offer", methods=["POST"])
+def webrtc_offer():
+    data = request.get_json(force=True)
+    offer_sdp = data.get("sdp")
+    offer_type = data.get("type", "offer")
+    if not offer_sdp:
+        return jsonify({"error": "missing sdp"}), 400
+
+    fut = asyncio.run_coroutine_threadsafe(handle_offer(offer_sdp, offer_type), loop)
+    try:
+        answer_sdp = fut.result(timeout=15)
+        return jsonify({"sdp": answer_sdp, "type": "answer"}), 200
+    except Exception as e:
+        logging.exception("Failed to create answer")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/tts")
+def tts_http():
+    """Client-side fetch for audio bytes. Query: /tts?text=Hello%20world"""
+    text = (request.args.get("text") or "").strip()
     if not text:
-        return jsonify({"success": False, "error": "Empty text"})
-    
-    # Add to our queue
-    text_queue.append(text)
-    
-    # Add to TTS service queue
-    tts_service.enqueue(text)
-    
-    return jsonify({"success": True, "message": "Text added to queue"})
-
-@app.route("/api/play-queue", methods=["POST"])
-def play_queue():
-    """Play all items in the queue"""
-    if not tts_service:
-        return jsonify({"success": False, "error": "TTS service not available"})
-    
-    if not text_queue:
-        return jsonify({"success": False, "error": "Queue is empty"})
-    
-    # All items are already queued in TTS service, just wait for completion
-    return jsonify({"success": True, "message": "Queue playback started"})
-
-@app.route("/api/clear-queue", methods=["POST"])
-def clear_queue():
-    """Clear the text queue"""
-    global text_queue
-    text_queue.clear()
-    return jsonify({"success": True, "message": "Queue cleared"})
-
-@app.route("/api/queue-length")
-def queue_length():
-    """Get the current queue length"""
-    return jsonify({"length": len(text_queue)})
-
-@app.route("/api/tts-info")
-def tts_info():
-    """Get information about the TTS service"""
-    if not tts_service:
-        return jsonify({"available": False, "error": "TTS service not initialized"})
-    
-    return jsonify({
-        "available": True,
-        "default_voice": tts_service._default_voice,
-        "default_model": tts_service._default_model
-    })
-
-@app.route("/api/audio-files")
-def list_audio_files():
-    """List all generated audio files"""
-    audio_dir = "audio_outputs"
-    if not os.path.exists(audio_dir):
-        return jsonify({"files": []})
-    
-    files = []
-    for filepath in glob.glob(os.path.join(audio_dir, "*.mp3")):
-        filename = os.path.basename(filepath)
-        stat = os.stat(filepath)
-        files.append({
-            "filename": filename,
-            "size": stat.st_size,
-            "timestamp": time.ctime(stat.st_mtime)
-        })
-    
-    # Sort by modification time (newest first)
-    files.sort(key=lambda x: x["timestamp"], reverse=True)
-    
-    return jsonify({"files": files})
-
-
-@app.route("/api/clear-audio", methods=["POST"])
-def clear_audio():
-    """Delete all audio files"""
-    audio_dir = "audio_outputs"
-    if not os.path.exists(audio_dir):
-        return jsonify({"success": True, "message": "No audio files to clear"})
-    
+        return "missing text", 400
     try:
-        deleted_count = 0
-        for filepath in glob.glob(os.path.join(audio_dir, "*.mp3")):
-            os.remove(filepath)
-            deleted_count += 1
-        
-        return jsonify({"success": True, "message": f"Deleted {deleted_count} audio files"})
+        audio_bytes = _free_tts_bytes(text)
+        # gTTS returns MP3; pyttsx3 returns WAV bytes – set mimetype accordingly
+        mimetype = "audio/mpeg" if FREE_TTS_PROVIDER == "gtts" else "audio/wav"
+        return send_file(io.BytesIO(audio_bytes), mimetype=mimetype)
     except Exception as e:
-        return jsonify({"error": f"Failed to clear audio files: {str(e)}"}), 500
+        logging.exception("TTS error: %s", e)
+        return "tts failed", 500
 
-@app.route("/api/play-audio", methods=["POST"])
-def play_audio():
-    """Start playing all audio files in chronological order"""
-    try:
-        if not audio_player.audio_available:
-            return jsonify({"success": False, "error": "Audio player not available"})
-        
-        if audio_player.is_playing:
-            return jsonify({"success": False, "error": "Audio is already playing"})
-        
-        # Start playback in background thread
-        audio_player.play_all_files_async()
-        
-        return jsonify({"success": True, "message": "Audio playback started"})
-    except Exception as e:
-        return jsonify({"success": False, "error": f"Failed to start playback: {str(e)}"}), 500
 
-@app.route("/api/stop-audio", methods=["POST"])
-def stop_audio():
-    """Stop current audio playback"""
-    try:
-        if not audio_player.is_playing:
-            return jsonify({"success": False, "error": "No audio is currently playing"})
-        
-        audio_player.stop_playback()
-        return jsonify({"success": True, "message": "Audio playback stopped"})
-    except Exception as e:
-        return jsonify({"success": False, "error": f"Failed to stop playback: {str(e)}"}), 500
+@app.route("/shutdown-peers", methods=["POST"])
+def shutdown_peers():
+    async def _close_all():
+        tasks = []
+        for k, sess in list(SESSIONS.items()):
+            try:
+                if sess.get("video_task"):
+                    sess["video_task"].cancel()
+            except Exception:
+                pass
+            tasks.append(sess["pc"].close())
+            SESSIONS.pop(k, None)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-@app.route("/api/playback-status")
-def playback_status():
-    """Get current playback status"""
-    try:
-        status = audio_player.get_status()
-        return jsonify(status)
-    except Exception as e:
-        return jsonify({"error": f"Failed to get status: {str(e)}"}), 500
+    asyncio.run_coroutine_threadsafe(_close_all(), loop).result(timeout=5)
+    return jsonify({"ok": True, "remaining": len(SESSIONS)}), 200
+
 
 if __name__ == "__main__":
-    print("Starting Flask TTS Application...")
-    print("Make sure to set ELEVENLABS_API_KEY environment variable")
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # keep debug=False so the dev reloader doesn't kill our asyncio loop
+    app.run(host="0.0.0.0", port=5001, debug=False, threaded=True)
