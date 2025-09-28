@@ -1,0 +1,7 @@
+flask==3.0.3
+flask-cors==4.0.1
+aiortc==1.9.0
+av==12.3.0
+numpy==2.1.1
+requests==2.32.3
+inference-sdk==0.9.11
