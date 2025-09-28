@@ -2,7 +2,7 @@ from openai import OpenAI
 
 def useClient(input_message):
     try:
-        client = OpenAI(api_key="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")
+        client = OpenAI()
         # while (True):
             # input_message = input("Enter your input words in brackets: ")
             # if input_message == "stop" or input_message == "STOP":
